@@ -141,17 +141,17 @@ def wavelet_decomposition_12terms(image):
 
 def wavelet_recomposition_12terms(r_LL, r_LH, r_HL, r_HH, g_LL, g_LH, g_HL, g_HH, b_LL, b_LH, b_HL, b_HH):
 
-    r_LL = (np.array(r_LL).astype(np.float64) * 2)/1.01
+    r_LL = (np.array(r_LL).astype(np.float64) * 2)/
     r_LH = ((np.array(r_LH).astype(np.float64) * 2) - 255)
     r_HL = ((np.array(r_HL).astype(np.float64) * 2) - 255)
     r_HH = ((np.array(r_HH).astype(np.float64) * 2) - 255)
 
-    g_LL = (np.array(g_LL).astype(np.float64) * 2)/1.01
+    g_LL = (np.array(g_LL).astype(np.float64) * 2)
     g_LH = ((np.array(g_LH).astype(np.float64) * 2) - 255)
     g_HL = ((np.array(g_HL).astype(np.float64) * 2) - 255)
     g_HH = ((np.array(g_HH).astype(np.float64) * 2) - 255)
 
-    b_LL = (np.array(b_LL).astype(np.float64) * 2)/1.01
+    b_LL = (np.array(b_LL).astype(np.float64) * 2)
     b_LH = ((np.array(b_LH).astype(np.float64) * 2) - 255)
     b_HL = ((np.array(b_HL).astype(np.float64) * 2) - 255)
     b_HH = ((np.array(b_HH).astype(np.float64) * 2) - 255)
@@ -171,9 +171,9 @@ def wavelet_recomposition_12terms(r_LL, r_LH, r_HL, r_HH, g_LL, g_LH, g_HL, g_HH
 
 def wavelet_recomposition_12terms_only_low(r_LL, g_LL, b_LL):
 
-    r_LL = (np.array(r_LL).astype(np.float64) * 2)/1.01
-    g_LL = (np.array(g_LL).astype(np.float64) * 2)/1.01
-    b_LL = (np.array(b_LL).astype(np.float64) * 2)/1.01
+    r_LL = (np.array(r_LL).astype(np.float64) * 2)
+    g_LL = (np.array(g_LL).astype(np.float64) * 2)
+    b_LL = (np.array(b_LL).astype(np.float64) * 2)
     r_reconstructed = pywt.idwt2((r_LL, (np.zeros_like(r_LL), np.zeros_like(r_LL), np.zeros_like(r_LL))), 'haar')
     g_reconstructed = pywt.idwt2((g_LL, (np.zeros_like(r_LL), np.zeros_like(r_LL), np.zeros_like(r_LL))), 'haar')
     b_reconstructed = pywt.idwt2((b_LL, (np.zeros_like(r_LL), np.zeros_like(r_LL), np.zeros_like(r_LL))), 'haar')
