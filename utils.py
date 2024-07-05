@@ -141,7 +141,7 @@ def wavelet_decomposition_12terms(image):
 
 def wavelet_recomposition_12terms(r_LL, r_LH, r_HL, r_HH, g_LL, g_LH, g_HL, g_HH, b_LL, b_LH, b_HL, b_HH):
 
-    r_LL = (np.array(r_LL).astype(np.float64) * 2)/
+    r_LL = (np.array(r_LL).astype(np.float64) * 2)
     r_LH = ((np.array(r_LH).astype(np.float64) * 2) - 255)
     r_HL = ((np.array(r_HL).astype(np.float64) * 2) - 255)
     r_HH = ((np.array(r_HH).astype(np.float64) * 2) - 255)

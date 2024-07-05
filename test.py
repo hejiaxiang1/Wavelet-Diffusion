@@ -238,21 +238,21 @@ def inference(wavelet_model,
     LH_reflect_recons = np.array(LH_reflect_recons)
     LH_reflect_recons = LH_reflect_recons.astype(np.float64)
     LH_reflect_recons=(LH_reflect_recons*2)
-    LH_reflect_recons=(LH_reflect_recons-255)/128 
+    LH_reflect_recons=(LH_reflect_recons-255)
 
     HL_reflect_recons = transforms.ToPILImage()(clear_HL.squeeze().cpu())
     #HL_reflect_recons = transforms.ToPILImage()(HL_reflect.squeeze().cpu())
     HL_reflect_recons = np.array(HL_reflect_recons)
     HL_reflect_recons = HL_reflect_recons.astype(np.float64)
     HL_reflect_recons=(HL_reflect_recons*2)
-    HL_reflect_recons=(HL_reflect_recons-255)/128
+    HL_reflect_recons=(HL_reflect_recons-255)
 
     HH_reflect_recons = transforms.ToPILImage()(clear_HH.squeeze().cpu())
     #HH_reflect_recons = transforms.ToPILImage()(HH_reflect.squeeze().cpu())
     HH_reflect_recons = np.array(HH_reflect_recons)
     HH_reflect_recons = HH_reflect_recons.astype(np.float64)
     HH_reflect_recons=(HH_reflect_recons*2)
-    HH_reflect_recons=(HH_reflect_recons-255)/128
+    HH_reflect_recons=(HH_reflect_recons-255)
 
     r_LH = LH - LH_reflect_recons
     r_HL = HL - HL_reflect_recons
