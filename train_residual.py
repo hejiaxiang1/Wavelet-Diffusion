@@ -131,6 +131,336 @@ def configure_optimizers(net, args):
     )
     return optimizer, aux_optimizer
 
+def get_model_input_time(ns, t_continuous):
+    if ns.schedule == 'discrete':
+        return (t_continuous - 1. / ns.total_N) * 1000.
+    else:
+        return t_continuous
+
+def conditioned_exp_iteration(exp_xt, ns, s, t, pre_wuq, exp_s1=None, mc_eps_exp_s1= None):
+
+    if pre_wuq == True:
+        exp_xt_next = exp_iteration(exp_xt, ns, s, t, mc_eps_exp_s1)
+        return exp_xt_next
+    else:
+        exp_xt_next = exp_iteration(exp_xt, ns, s, t, exp_s1)
+        return exp_xt_next
+
+def conditioned_var_iteration(var_xt, ns, s, t, pre_wuq, cov_xt_epst= None, var_epst = None):
+
+    if pre_wuq == True:
+        var_xt_next = var_iteration(var_xt, ns, s, t, cov_xt_epst, var_epst)
+        return var_xt_next
+    else:
+        log_alpha_s, log_alpha_t = ns.marginal_log_mean_coeff(s), ns.marginal_log_mean_coeff(t)
+        var_xt_next = torch.square(torch.exp(log_alpha_t - log_alpha_s)) * var_xt
+        return var_xt_next
+
+def conditioned_update(ns, x, s, t, custom_model, model_s, pre_wuq, r1=0.5, **model_kwargs):
+    if pre_wuq == True:
+        return singlestep_dpm_solver_second_update(ns, x, s, t, custom_model, model_s, r1=0.5, **model_kwargs)
+    else:
+        lambda_s, lambda_t = ns.marginal_lambda(s), ns.marginal_lambda(t)
+        h = lambda_t - lambda_s
+        lambda_s1 = lambda_s + r1 * h
+        s1 = ns.inverse_lambda(lambda_s1)
+        log_alpha_s, log_alpha_s1, log_alpha_t = ns.marginal_log_mean_coeff(s), ns.marginal_log_mean_coeff(s1), ns.marginal_log_mean_coeff(t)
+        sigma_s1, sigma_t = ns.marginal_std(s1), ns.marginal_std(t)
+
+        phi_11 = torch.expm1(r1 * h)
+        phi_1 = torch.expm1(h)
+        
+        x_s1 = (
+            torch.exp(log_alpha_s1 - log_alpha_s) * x
+            - (sigma_s1 * phi_11) * model_s
+        )
+
+        input_s1 = get_model_input_time(ns, s1)
+        model_s1 = custom_model.accurate_forward(x_s1, input_s1.expand(x_s1.shape[0]), **model_kwargs)
+
+        x_t = (
+            torch.exp(log_alpha_t - log_alpha_s) * x
+            - (sigma_t * phi_1) * model_s
+            - (0.5 / r1) * (sigma_t * phi_1) * (model_s1 - model_s)
+        )
+
+        return x_t, model_s1
+
+def train_one_epoch2(
+    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, diffusion_model, diffusion_model_LH, diffusion_model_HL, diffusion_model_HH,
+    ns, t_seq, uq_array, custom_model, mc_sample_size, device
+):
+    model.train()
+    for i, d in enumerate(train_dataloader):
+        d = d.to(device)
+        tensor1, tensor2, tensor3 = torch.split(d, split_size_or_sections=1, dim=1)
+        
+        x_start_LH = tensor1
+        xT_LH = torch.randn_like(x_start_LH)
+        T = t_seq[0]
+        xt_next_LH = xT_LH
+        exp_xt_next_LH = xT_LH
+        var_xt_next_LH = torch.zeros_like(xT_LH).to(device)
+        eps_mu_t_next_LH = custom_model.accurate_forward(xT_LH, get_model_input_time(ns, T).expand(xT_LH.shape[0]))
+        for timestep in range(len(t_seq) - 1):
+            if uq_array[timestep]:
+                xt_LH = xt_next_LH
+                exp_xt_LH = exp_xt_next_LH
+                var_xt_LH = var_xt_next_LH
+                eps_mu_t_LH = eps_mu_t_next_LH
+                s, t = t_seq[timestep], t_seq[timestep + 1]
+                xt_next_LH, model_s1_LH, _ = conditioned_update(ns, xt_LH, s, t, custom_model, eps_mu_t_LH, pre_wuq=uq_array[timestep],1 r=0.5)
+                exp_xt_next_LH = conditioned_exp_iteration(exp_xt_LH, ns, s, t, pre_wuq=uq_array[timestep], mc_eps_exp_s1=torch.mean(eps_mu_t_LH, dim=0))
+                var_xt_next_LH = conditioned_var_iteration(var_xt_LH, ns, s, t, pre_wuq=uq_array[timestep])
+                if uq_array[timestep + 1]:
+                    list_xt_next_i_LH, list_eps_mu_t_next_i_LH = [], []
+                    s_next = t_seq[timestep + 1]
+                    t_next = t_seq[timestep + 2] if timestep + 2 < len(t_seq) else t_seq[-1]
+                    lambda_s_next, lambda_t_next = ns.marginal_lambda(s_next), ns.marginal_lambda(t_next)
+                    h_next = lambda_t_next - lambda_s_next
+                    lambda_s1_next = lambda_s_next + 0.5 * h_next
+                    s1_next = ns.inverse_lambda(lambda_s1_next)
+                    sigma_s1_next = ns.marginal_std(s1_next)
+                    log_alpha_s_next, log_alpha_s1_next = ns.marginal_log_mean_coeff(s_next), ns.marginal_log_mean_coeff(s1_next)
+                    phi_11_next = torch.expm1(0.5 * h_next)
+                    for _ in range(mc_sample_size):
+                        var_xt_next_LH = torch.clamp(var_xt_next_LH, min=0)
+                        xt_next_i_LH = sample_from_gaussion(exp_xt_next_LH, var_xt_next_LH)
+                        list_xt_next_i_LH.append(xt_next_i_LH)
+                        model_t_i_LH, model_t_i_var_LH = custom_model(xt_next_i_LH, get_model_input_time(ns, s_next).expand(xt_next_i_LH.shape[0]))
+                        xu_next_i_LH = sample_from_gaussion(torch.exp(log_alpha_s1_next - log_alpha_s_next) * xt_next_i_LH - (sigma_s1_next * phi_11_next) * model_t_i_LH, torch.square(sigma_s1_next * phi_11_next) * model_t_i_var_LH)
+                        model_u_i_LH, _ = custom_model(xu_next_i_LH, get_model_input_time(ns, s1_next).expand(xt_next_i_LH.shape[0]))
+                        list_eps_mu_t_next_i_LH.append(model_u_i_LH)
+                    eps_mu_t_next_LH, eps_var_t_next_LH = custom_model(xt_next_LH, get_model_input_time(ns, s_next).expand(xt_next_LH.shape[0]))
+                    list_xt_next_i_LH = torch.stack(list_xt_next_i_LH, dim=0).to(device)
+                    list_eps_mu_t_next_i_LH = torch.stack(list_eps_mu_t_next_i_LH, dim=0).to(device)
+                    cov_xt_next_epst_next_LH = torch.mean(list_xt_next_i_LH * list_eps_mu_t_next_i_LH, dim=0) - exp_xt_next_LH * torch.mean(list_eps_mu_t_next_i_LH, dim=0)
+                else:
+                    eps_mu_t_next_LH = custom_model.accurate_forward(xt_next_LH, get_model_input_time(ns, t).expand(xt_next_LH.shape[0]))
+            else:
+                xt_LH = xt_next_LH
+                exp_xt_LH = exp_xt_next_LH
+                var_xt_LH = var_xt_next_LH
+                eps_mu_t_LH = eps_mu_t_next_LH
+                s, t = t_seq[timestep], t_seq[timestep + 1]
+                xt_next_LH, model_s1_LH = conditioned_update(ns, xt_LH, s, t, custom_model, eps_mu_t_LH, pre_wuq=uq_array[timestep r],1=0.5)
+                exp_xt_next_LH = conditioned_exp_iteration(exp_xt_LH, ns, s, t, exp_s1=model_s1_LH, pre_wuq=uq_array[timestep])
+                var_xt_next_LH = conditioned_var_iteration(var_xt_LH, ns, s, t, pre_wuq=uq_array[timestep])
+                if uq_array[timestep + 1]:
+                    list_xt_next_i_LH, list_eps_mu_t_next_i_LH = [], []
+                    s_next = t_seq[timestep + 1]
+                    t_next = t_seq[timestep + 2] if timestep + 2 < len(t_seq) else t_seq[-1]
+                    lambda_s_next, lambda_t_next = ns.marginal_lambda(s_next), ns.marginal_lambda(t_next)
+                    h_next = lambda_t_next - lambda_s_next
+                    lambda_s1_next = lambda_s_next + 0.5 * h_next
+                    s1_next = ns.inverse_lambda(lambda_s1_next)
+                    sigma_s1_next = ns.marginal_std(s1_next)
+                    log_alpha_s_next, log_alpha_s1_next = ns.marginal_log_mean_coeff(s_next), ns.marginal_log_mean_coeff(s1_next)
+                    phi_11_next = torch.expm1(0.5 * h_next)
+                    for _ in range(mc_sample_size):
+                        var_xt_next_LH = torch.clamp(var_xt_next_LH, min=0)
+                        xt_next_i_LH = sample_from_gaussion(exp_xt_next_LH, var_xt_next_LH)
+                        list_xt_next_i_LH.append(xt_next_i_LH)
+                        model_t_i_LH, model_t_i_var_LH = custom_model(xt_next_i_LH, get_model_input_time(ns, s_next).expand(xt_next_i_LH.shape[0]))
+                        xu_next_i_LH = sample_from_gaussion(torch.exp(log_alpha_s1_next - log_alpha_s_next) * xt_next_i_LH - (sigma_s1_next * phi_11_next) * model_t_i_LH, torch.square(sigma_s1_next * phi_11_next) * model_t_i_var_LH)
+                        model_u_i_LH, _ = custom_model(xu_next_i_LH, get_model_input_time(ns, s1_next).expand(xt_next_i_LH.shape[0]))
+                        list_eps_mu_t_next_i_LH.append(model_u_i_LH)
+                    eps_mu_t_next_LH, eps_var_t_next_LH = custom_model(xt_next_LH, get_model_input_time(ns, s_next).expand(xt_next_LH.shape[0]))
+                    list_xt_next_i_LH = torch.stack(list_xt_next_i_LH, dim=0).to(device)
+                    list_eps_mu_t_next_i_LH = torch.stack(list_eps_mu_t_next_i_LH, dim=0).to(device)
+                    cov_xt_next_epst_next_LH = torch.mean(list_xt_next_i_LH * list_eps_mu_t_next_i_LH, dim=0) - exp_xt_next_LH * torch.mean(list_eps_mu_t_next_i_LH, dim=0)
+                else:
+                    eps_mu_t_next_LH = custom_model.accurate_forward(xt_next_LH, get_model_input_time(ns, t).expand(xt_next_LH.shape[0]))
+        variance_LH = var_xt_next_LH
+        
+
+        x_start_HL = tensor2
+        xT_HL = torch.randn_like(x_start_HL)
+        T = t_seq[0]
+        xt_next_HL = xT_HL
+        exp_xt_next_HL = xT_HL
+        var_xt_next_HL = torch.zeros_like(xT_HL).to(device)
+        eps_mu_t_next_HL = custom_model.accurate_forward(xT_HL, get_model_input_time(ns, T).expand(xT_HL.shape[0]))
+        for timestep in range(len(t_seq) - 1):
+            if uq_array[timestep]:
+                xt_HL = xt_next_HL
+                exp_xt_HL = exp_xt_next_HL
+                var_xt_HL = var_xt_next_HL
+                eps_mu_t_HL = eps_mu_t_next_HL
+                s, t = t_seq[timestep], t_seq[timestep + 1]
+                xt_next_HL, model_s1_HL, _ = conditioned_update(ns, xt_HL, s, t, custom_model, eps_mu_t_HL, pre_wuq=uq_array[timestep], r=0.5)
+                exp_xt_next_HL = conditioned_exp_iteration(exp_xt_HL, ns, s, t, pre_wuq=uq_array[timestep], mc_eps_exp_s1=torch.mean(eps_mu_t_HL, dim=0))
+                var_xt_next_HL = conditioned_var_iteration(var_xt_HL, ns, s, t, pre_wuq=uq_array[timestep])
+                if uq_array[timestep + 1]:
+                    list_xt_next_i_HL, list_eps_mu_t_next_i_HL = [], []
+                    s_next = t_seq[timestep + 1]
+                    t_next = t_seq[timestep + 2] if timestep + 2 < len(t_seq) else t_seq[-1]
+                    lambda_s_next, lambda_t_next = ns.marginal_lambda(s_next), ns.marginal_lambda(t_next)
+                    h_next = lambda_t_next - lambda_s_next
+                    lambda_s1_next = lambda_s_next + 0.5 * h_next
+                    s1_next = ns.inverse_lambda(lambda_s1_next)
+                    sigma_s1_next = ns.marginal_std(s1_next)
+                    log_alpha_s_next, log_alpha_s1_next = ns.marginal_log_mean_coeff(s_next), ns.marginal_log_mean_coeff(s1_next)
+                    phi_11_next = torch.expm1(0.5 * h_next)
+                    for _ in range(mc_sample_size):
+                        var_xt_next_HL = torch.clamp(var_xt_next_HL, min=0)
+                        xt_next_i_HL = sample_from_gaussion(exp_xt_next_HL, var_xt_next_HL)
+                        list_xt_next_i_HL.append(xt_next_i_HL)
+                        model_t_i_HL, model_t_i_var_HL = custom_model(xt_next_i_HL, get_model_input_time(ns, s_next).expand(xt_next_i_HL.shape[0]))
+                        xu_next_i_HL = sample_from_gaussion(torch.exp(log_alpha_s1_next - log_alpha_s_next) * xt_next_i_HL - (sigma_s1_next * phi_11_next) * model_t_i_HL, torch.square(sigma_s1_next * phi_11_next) * model_t_i_var_HL)
+                        model_u_i_HL, _ = custom_model(xu_next_i_HL, get_model_input_time(ns, s1_next).expand(xt_next_i_HL.shape[0]))
+                        list_eps_mu_t_next_i_HL.append(model_u_i_HL)
+                    eps_mu_t_next_HL, eps_var_t_next_HL = custom_model(xt_next_HL, get_model_input_time(ns, s_next).expand(xt_next_HL.shape[0]))
+                    list_xt_next_i_HL = torch.stack(list_xt_next_i_HL, dim=0).to(device)
+                    list_eps_mu_t_next_i_HL = torch.stack(list_eps_mu_t_next_i_HL, dim=0).to(device)
+                    cov_xt_next_epst_next_HL = torch.mean(list_xt_next_i_HL * list_eps_mu_t_next_i_HL, dim=0) - exp_xt_next_HL * torch.mean(list_eps_mu_t_next_i_HL, dim=0)
+                else:
+                    eps_mu_t_next_HL = custom_model.accurate_forward(xt_next_HL, get_model_input_time(ns, t).expand(xt_next_HL.shape[0]))
+            else:
+                xt_HL = xt_next_HL
+                exp_xt_HL = exp_xt_next_HL
+                var_xt_HL = var_xt_next_HL
+                eps_mu_t_HL = eps_mu_t_next_HL
+                s, t = t_seq[timestep], t_seq[timestep + 1]
+                xt_next_HL, model_s1_HL = conditioned_update(ns, xt_HL, s, t, custom_model, eps_mu_t_HL, pre_wuq=uq_array[timestep], r=0.5)
+                exp_xt_next_HL = conditioned_exp_iteration(exp_xt_HL, ns, s, t, exp_s1=model_s1_HL, pre_wuq=uq_array[timestep])
+                var_xt_next_HL = conditioned_var_iteration(var_xt_HL, ns, s, t, pre_wuq=uq_array[timestep])
+                if uq_array[timestep + 1]:
+                    list_xt_next_i_HL, list_eps_mu_t_next_i_HL = [], []
+                    s_next = t_seq[timestep + 1]
+                    t_next = t_seq[timestep + 2] if timestep + 2 < len(t_seq) else t_seq[-1]
+                    lambda_s_next, lambda_t_next = ns.marginal_lambda(s_next), ns.marginal_lambda(t_next)
+                    h_next = lambda_t_next - lambda_s_next
+                    lambda_s1_next = lambda_s_next + 0.5 * h_next
+                    s1_next = ns.inverse_lambda(lambda_s1_next)
+                    sigma_s1_next = ns.marginal_std(s1_next)
+                    log_alpha_s_next, log_alpha_s1_next = ns.marginal_log_mean_coeff(s_next), ns.marginal_log_mean_coeff(s1_next)
+                    phi_11_next = torch.expm1(0.5 * h_next)
+                    for _ in range(mc_sample_size):
+                        var_xt_next_HL = torch.clamp(var_xt_next_HL, min=0)
+                        xt_next_i_HL = sample_from_gaussion(exp_xt_next_HL, var_xt_next_HL)
+                        list_xt_next_i_HL.append(xt_next_i_HL)
+                        model_t_i_HL, model_t_i_var_HL = custom_model(xt_next_i_HL, get_model_input_time(ns, s_next).expand(xt_next_i_HL.shape[0]))
+                        xu_next_i_HL = sample_from_gaussion(torch.exp(log_alpha_s1_next - log_alpha_s_next) * xt_next_i_HL - (sigma_s1_next * phi_11_next) * model_t_i_HL, torch.square(sigma_s1_next * phi_11_next) * model_t_i_var_HL)
+                        model_u_i_HL, _ = custom_model(xu_next_i_HL, get_model_input_time(ns, s1_next).expand(xt_next_i_HL.shape[0]))
+                        list_eps_mu_t_next_i_HL.append(model_u_i_HL)
+                    eps_mu_t_next_HL, eps_var_t_next_HL = custom_model(xt_next_HL, get_model_input_time(ns, s_next).expand(xt_next_HL.shape[0]))
+                    list_xt_next_i_HL = torch.stack(list_xt_next_i_HL, dim=0).to(device)
+                    list_eps_mu_t_next_i_HL = torch.stack(list_eps_mu_t_next_i_HL, dim=0).to(device)
+                    cov_xt_next_epst_next_HL = torch.mean(list_xt_next_i_HL * list_eps_mu_t_next_i_HL, dim=0) - exp_xt_next_HL * torch.mean(list_eps_mu_t_next_i_HL, dim=0)
+                else:
+                    eps_mu_t_next_HL = custom_model.accurate_forward(xt_next_HL, get_model_input_time(ns, t).expand(xt_next_HL.shape[0]))
+        variance_HL = var_xt_next_HL
+        
+        x_start_HH = tensor3
+        xT_HH = torch.randn_like(x_start_HH)
+        T = t_seq[0]
+        xt_next_HH = xT_HH
+        exp_xt_next_HH = xT_HH
+        var_xt_next_HH = torch.zeros_like(xT_HH).to(device)
+        eps_mu_t_next_HH = custom_model.accurate_forward(xT_HH, get_model_input_time(ns, T).expand(xT_HH.shape[0]))
+
+        for timestep in range(len(t_seq) - 1):
+            if uq_array[timestep]:
+                xt_HH = xt_next_HH
+                exp_xt_HH = exp_xt_next_HH
+                var_xt_HH = var_xt_next_HH
+                eps_mu_t_HH = eps_mu_t_next_HH
+                s, t = t_seq[timestep], t_seq[timestep + 1]
+                xt_next_HH, model_s1_HH, _ = conditioned_update(ns, xt_HH, s, t, custom_model, eps_mu_t_HH, pre_wuq=uq_array[timestep], r=0.5)
+                exp_xt_next_HH = conditioned_exp_iteration(exp_xt_HH, ns, s, t, pre_wuq=uq_array[timestep], mc_eps_exp_s1=torch.mean(eps_mu_t_HH, dim=0))
+                var_xt_next_HH = conditioned_var_iteration(var_xt_HH, ns, s, t, pre_wuq=uq_array[timestep])
+                if uq_array[timestep + 1]:
+                    list_xt_next_i_HH, list_eps_mu_t_next_i_HH = [], []
+                    s_next = t_seq[timestep + 1]
+                    t_next = t_seq[timestep + 2] if timestep + 2 < len(t_seq) else t_seq[-1]
+                    lambda_s_next, lambda_t_next = ns.marginal_lambda(s_next), ns.marginal_lambda(t_next)
+                    h_next = lambda_t_next - lambda_s_next
+                    lambda_s1_next = lambda_s_next + 0.5 * h_next
+                    s1_next = ns.inverse_lambda(lambda_s1_next)
+                    sigma_s1_next = ns.marginal_std(s1_next)
+                    log_alpha_s_next, log_alpha_s1_next = ns.marginal_log_mean_coeff(s_next), ns.marginal_log_mean_coeff(s1_next)
+                    phi_11_next = torch.expm1(0.5 * h_next)
+                    for _ in range(mc_sample_size):
+                        var_xt_next_HH = torch.clamp(var_xt_next_HH, min=0)
+                        xt_next_i_HH = sample_from_gaussion(exp_xt_next_HH, var_xt_next_HH)
+                        list_xt_next_i_HH.append(xt_next_i_HH)
+                        model_t_i_HH, model_t_i_var_HH = custom_model(xt_next_i_HH, get_model_input_time(ns, s_next).expand(xt_next_i_HH.shape[0]))
+                        xu_next_i_HH = sample_from_gaussion(torch.exp(log_alpha_s1_next - log_alpha_s_next) * xt_next_i_HH - (sigma_s1_next * phi_11_next) * model_t_i_HH, torch.square(sigma_s1_next * phi_11_next) * model_t_i_var_HH)
+                        model_u_i_HH, _ = custom_model(xu_next_i_HH, get_model_input_time(ns, s1_next).expand(xt_next_i_HH.shape[0]))
+                        list_eps_mu_t_next_i_HH.append(model_u_i_HH)
+                    eps_mu_t_next_HH, eps_var_t_next_HH = custom_model(xt_next_HH, get_model_input_time(ns, s_next).expand(xt_next_HH.shape[0]))
+                    list_xt_next_i_HH = torch.stack(list_xt_next_i_HH, dim=0).to(device)
+                    list_eps_mu_t_next_i_HH = torch.stack(list_eps_mu_t_next_i_HH, dim=0).to(device)
+                    cov_xt_next_epst_next_HH = torch.mean(list_xt_next_i_HH * list_eps_mu_t_next_i_HH, dim=0) - exp_xt_next_HH * torch.mean(list_eps_mu_t_next_i_HH, dim=0)
+                else:
+                    eps_mu_t_next_HH = custom_model.accurate_forward(xt_next_HH, get_model_input_time(ns, t).expand(xt_next_HH.shape[0]))
+            else:
+                xt_HH = xt_next_HH
+                exp_xt_HH = exp_xt_next_HH
+                var_xt_HH = var_xt_next_HH
+                eps_mu_t_HH = eps_mu_t_next_HH
+                s, t = t_seq[timestep], t_seq[timestep + 1]
+                xt_next_HH, model_s1_HH = conditioned_update(ns, xt_HH, s, t, custom_model, eps_mu_t_HH, pre_wuq=uq_array[timestep], r=0.5)
+                exp_xt_next_HH = conditioned_exp_iteration(exp_xt_HH, ns, s, t, exp_s1=model_s1_HH, pre_wuq=uq_array[timestep])
+                var_xt_next_HH = conditioned_var_iteration(var_xt_HH, ns, s, t, pre_wuq=uq_array[timestep])
+                if uq_array[timestep + 1]:
+                    list_xt_next_i_HH, list_eps_mu_t_next_i_HH = [], []
+                    s_next = t_seq[timestep + 1]
+                    t_next = t_seq[timestep + 2] if timestep + 2 < len(t_seq) else t_seq[-1]
+                    lambda_s_next, lambda_t_next = ns.marginal_lambda(s_next), ns.marginal_lambda(t_next)
+                    h_next = lambda_t_next - lambda_s_next
+                    lambda_s1_next = lambda_s_next + 0.5 * h_next
+                    s1_next = ns.inverse_lambda(lambda_s1_next)
+                    sigma_s1_next = ns.marginal_std(s1_next)
+                    log_alpha_s_next, log_alpha_s1_next = ns.marginal_log_mean_coeff(s_next), ns.marginal_log_mean_coeff(s1_next)
+                    phi_11_next = torch.expm1(0.5 * h_next)
+                    for _ in range(mc_sample_size):
+                        var_xt_next_HH = torch.clamp(var_xt_next_HH, min=0)
+                        xt_next_i_HH = sample_from_gaussion(exp_xt_next_HH, var_xt_next_HH)
+                        list_xt_next_i_HH.append(xt_next_i_HH)
+                        model_t_i_HH, model_t_i_var_HH = custom_model(xt_next_i_HH, get_model_input_time(ns, s_next).expand(xt_next_i_HH.shape[0]))
+                        xu_next_i_HH = sample_from_gaussion(torch.exp(log_alpha_s1_next - log_alpha_s_next) * xt_next_i_HH - (sigma_s1_next * phi_11_next) * model_t_i_HH, torch.square(sigma_s1_next * phi_11_next) * model_t_i_var_HH)
+                        model_u_i_HH, _ = custom_model(xu_next_i_HH, get_model_input_time(ns, s1_next).expand(xt_next_i_HH.shape[0]))
+                        list_eps_mu_t_next_i_HH.append(model_u_i_HH)
+                    eps_mu_t_next_HH, eps_var_t_next_HH = custom_model(xt_next_HH, get_model_input_time(ns, s_next).expand(xt_next_HH.shape[0]))
+                    list_xt_next_i_HH = torch.stack(list_xt_next_i_HH, dim=0).to(device)
+                    list_eps_mu_t_next_i_HH = torch.stack(list_eps_mu_t_next_i_HH, dim=0).to(device)
+                    cov_xt_next_epst_next_HH = torch.mean(list_xt_next_i_HH * list_eps_mu_t_next_i_HH, dim=0) - exp_xt_next_HH * torch.mean(list_eps_mu_t_next_i_HH, dim=0)
+                else:
+                    eps_mu_t_next_HH = custom_model.accurate_forward(xt_next_HH, get_model_input_time(ns, t).expand(xt_next_HH.shape[0]))
+        variance_HH = var_xt_next_HH
+
+        del tensor1, tensor2, tensor3, x_start_LH, x_start_HL, x_start_HH
+        del xT_LH, xT_HL, xT_HH, xt_next_LH, xt_next_HL, xt_next_HH
+        del exp_xt_next_LH, exp_xt_next_HL, exp_xt_next_HH
+        del var_xt_next_LH, var_xt_next_HL, var_xt_next_HH
+        del eps_mu_t_next_LH, eps_mu_t_next_HL, eps_mu_t_next_HH
+    
+        optimizer.zero_grad()
+        aux_optimizer.zero_grad()
+        out_net = model(d)
+        out_criterion = criterion(out_net, d, variance_LH, variance_HL, variance_HH)
+        out_criterion["loss"].backward()
+        if clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
+        optimizer.step()
+        aux_loss = model.aux_loss()
+        aux_loss.backward()
+        aux_optimizer.step()
+        
+        if i % 100 == 0:
+            print(
+                f"Train epoch {epoch}: ["
+                f"{i * len(d)}/{len(train_dataloader.dataset)} "
+                f"({100. * i / len(train_dataloader):.0f}%)] "
+                f"Loss: {out_criterion['loss'].item():.3f} | "
+                f"MSE loss: {out_criterion['mse_loss'].item() * 255 ** 2 / 3:.3f} | "
+                f"Bpp loss: {out_criterion['bpp_loss'].item():.2f} | "
+                f"Traditional loss: {out_criterion['traditional_loss'].item():.2f} | "
+                f"Additional loss: {out_criterion['additional_loss'].item():.2f} | "
+                f"Aux loss: {aux_loss.item():.2f}"
+            )
 
 def train_one_epoch(
     model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, diffusion_model, diffusion_model_LH, diffusion_model_HL, diffusion_model_HH
